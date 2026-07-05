@@ -1,0 +1,148 @@
+export default {
+  async fetch(request) {
+    if (request.method === 'OPTIONS') {
+      return new Response(null, { headers: { 'Access-Control-Allow-Origin': '*', 'Access-Control-Allow-Headers': '*' } });
+    }
+ 
+    try {
+      const body = await request.json();
+      const isStream = body.stream === true;
+      
+      const rawModel = body.model || 'gemini-3.1-flash-lite-preview';
+      const model = String(rawModel).replace(/^models\//, '').trim();
+      
+      const maxTokens = 8192; 
+ 
+      let systemInstructionText = "";
+      let contents = [];
+      
+      for (const msg of body.messages || []) {
+        if (msg.role === 'system') {
+          systemInstructionText += msg.content + "\n";
+        } else {
+          const mappedRole = msg.role === 'assistant' ? 'model' : 'user';
+          if (contents.length > 0 && contents[contents.length - 1].role === mappedRole) {
+            contents[contents.length - 1].parts[0].text += "\n\n" + msg.content;
+          } else {
+            contents.push({ role: mappedRole, parts: [{ text: msg.content }] });
+          }
+        }
+      }
+ 
+      if (systemInstructionText.trim() !== "") {
+        const smuggledPrompt = `[System Context/Character Definition:\n${systemInstructionText.trim()}]\n\n`;
+        if (contents.length > 0 && contents[0].role === 'user') {
+          contents[0].parts[0].text = smuggledPrompt + contents[0].parts[0].text;
+        } else {
+          contents.unshift({ role: 'user', parts: [{ text: smuggledPrompt }] });
+        }
+      }
+ 
+      const geminiPayload = {
+        contents: contents,
+        safetySettings: [
+          { category: "HARM_CATEGORY_HARASSMENT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_HATE_SPEECH", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_SEXUALLY_EXPLICIT", threshold: "BLOCK_NONE" },
+          { category: "HARM_CATEGORY_DANGEROUS_CONTENT", threshold: "BLOCK_NONE" }
+        ],
+        generationConfig: {
+          temperature: body.temperature || 0.8,
+          maxOutputTokens: maxTokens
+        }
+      };
+ 
+      const authHeader = request.headers.get('Authorization') || '';
+      const apiKey = authHeader.replace('Bearer ', '').trim();
+ 
+      if (isStream) {
+        const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse&key=${apiKey}`;
+        const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(geminiPayload) });
+ 
+        // THE FIX: Catch hidden Google API errors before streaming fails
+        if (!response.ok) {
+          const errorData = await response.json();
+          const errorMsg = errorData.error?.message || "Unknown Google API Error";
+          return new Response(JSON.stringify({ error: { message: `[GOOGLE API BLOCKED IT]: ${errorMsg}` } }), { 
+            status: 400, 
+            headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } 
+          });
+        }
+ 
+        const { readable, writable } = new TransformStream();
+        const writer = writable.getWriter();
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder("utf-8");
+        const encoder = new TextEncoder();
+ 
+        (async () => {
+          try {
+            let buffer = "";
+            while (true) {
+              const { done, value } = await reader.read();
+              if (done) break;
+              buffer += decoder.decode(value, { stream: true });
+              const lines = buffer.split('\n');
+              buffer = lines.pop(); 
+ 
+              for (const line of lines) {
+                if (line.startsWith('data: ')) {
+                  const dataStr = line.replace('data: ', '').trim();
+                  if (!dataStr) continue;
+                  try {
+                    const dataObj = JSON.parse(dataStr);
+                    let textPart = "";
+                    if (dataObj.candidates?.[0]?.content?.parts?.[0]?.text) {
+                      textPart = dataObj.candidates[0].content.parts[0].text;
+                    }
+                    if (textPart) {
+                      const chunk = {
+                        id: "chatcmpl-" + Date.now(),
+                        object: "chat.completion.chunk",
+                        created: Math.floor(Date.now() / 1000),
+                        model: model,
+                        choices: [{ index: 0, delta: { content: textPart }, finish_reason: null }]
+                      };
+                      await writer.write(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+                    }
+                  } catch (e) {} 
+                }
+              }
+            }
+            await writer.write(encoder.encode("data: [DONE]\n\n"));
+            await writer.close();
+          } catch (e) {
+            await writer.abort(e);
+          }
+        })();
+ 
+        return new Response(readable, { headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'text/event-stream' } });
+      } else {
+         const targetUrl = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
+         const response = await fetch(targetUrl, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(geminiPayload) });
+         
+         if (!response.ok) {
+           const errorData = await response.json();
+           const errorMsg = errorData.error?.message || "Unknown Google API Error";
+           return new Response(JSON.stringify({ error: { message: `[GOOGLE API BLOCKED IT]: ${errorMsg}` } }), { 
+             status: 400, 
+             headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } 
+           });
+         }
+ 
+         const data = await response.json();
+         let replyText = data.candidates?.[0]?.content?.parts?.[0]?.text || "";
+         const openaiResponse = {
+            id: "chatcmpl-" + Date.now(),
+            object: "chat.completion",
+            created: Math.floor(Date.now() / 1000),
+            model: model,
+            choices: [{ index: 0, message: { role: "assistant", content: replyText }, finish_reason: "stop" }]
+         };
+         return new Response(JSON.stringify(openaiResponse), { headers: { 'Access-Control-Allow-Origin': '*', 'Content-Type': 'application/json' } });
+      }
+    } catch (e) {
+      return new Response(JSON.stringify({ error: { message: e.message } }), { status: 500, headers: { 'Access-Control-Allow-Origin': '*' } });
+    }
+  }
+};
